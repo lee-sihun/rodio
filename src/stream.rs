@@ -19,6 +19,22 @@ use std::num::NonZero;
 
 const HZ_44100: SampleRate = nz!(44_100);
 
+/// Preferred low-latency buffer sizes followed by default host behavior.
+fn preferred_buffer_sizes(supported: &cpal::SupportedBufferSize) -> Vec<BufferSize> {
+    let mut candidates = Vec::with_capacity(4);
+
+    if let cpal::SupportedBufferSize::Range { min, max } = supported {
+        for size in [128u32, 256, 512] {
+            if size >= *min && size <= *max {
+                candidates.push(BufferSize::Fixed(size));
+            }
+        }
+    }
+
+    candidates.push(BufferSize::Default);
+    candidates
+}
+
 /// `cpal::Stream` container. Use `mixer()` method to control output.
 ///
 /// <div class="warning">When dropped playback will end, and the associated
@@ -186,10 +202,15 @@ impl DeviceSinkBuilder {
         let default_config = device
             .default_output_config()
             .map_err(DeviceSinkError::DefaultSinkConfigError)?;
+        let preferred_buffer_size = preferred_buffer_sizes(default_config.buffer_size())
+            .into_iter()
+            .next()
+            .unwrap_or(BufferSize::Default);
 
         Ok(Self::default()
             .with_device(device)
-            .with_supported_config(&default_config))
+            .with_supported_config(&default_config)
+            .with_buffer_size(preferred_buffer_size))
     }
 
     /// Sets default OS-Sink parameters for default output audio device.
@@ -206,7 +227,7 @@ impl DeviceSinkBuilder {
     /// If all attempts fail return the initial error.
     pub fn open_default_sink() -> Result<MixerDeviceSink, DeviceSinkError> {
         Self::from_default_device()
-            .and_then(|x| x.open_stream())
+            .and_then(|x| x.open_sink_or_fallback())
             .or_else(|original_err| {
                 let mut devices = match cpal::default_host().output_devices() {
                     Ok(devices) => devices,
@@ -365,13 +386,16 @@ where
 
         MixerDeviceSink::open(device, &self.config, error_callback.clone()).or_else(|err| {
             for supported_config in supported_output_configs(device)? {
-                if let Ok(handle) = DeviceSinkBuilder::default()
-                    .with_device(device.clone())
-                    .with_supported_config(&supported_config)
-                    .with_error_callback(error_callback.clone())
-                    .open_stream()
-                {
-                    return Ok(handle);
+                for buffer_size in preferred_buffer_sizes(supported_config.buffer_size()) {
+                    if let Ok(handle) = DeviceSinkBuilder::default()
+                        .with_device(device.clone())
+                        .with_supported_config(&supported_config)
+                        .with_buffer_size(buffer_size)
+                        .with_error_callback(error_callback.clone())
+                        .open_stream()
+                    {
+                        return Ok(handle);
+                    }
                 }
             }
             Err(err)
